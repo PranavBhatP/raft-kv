@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   peer1:
     build:

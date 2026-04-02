@@ -58,14 +58,20 @@ func main() {
 	if peers != "" {
 		peerConfigs := strings.Split(peers, ",")
 		for _, peerConfig := range peerConfigs {
-			parts := strings.Split(peerConfig, ":") //config has format "peerId:peerAddr"
+			parts := strings.SplitN(strings.TrimSpace(peerConfig), ":", 2) // config format is "peerHost:peerPort"
 			if len(parts) != 2 {
 				log.Fatalf("invalid peer config: %s", peerConfig)
 				continue
 			}
-			peerId, _ := strconv.Atoi(parts[0])
+			peerHost := parts[0]
+			peerIdStr := strings.TrimPrefix(peerHost, "peer")
+			peerId, err := strconv.Atoi(peerIdStr)
+			if err != nil {
+				log.Fatalf("invalid peer host %q in config %q; expected peer<id>", peerHost, peerConfig)
+				continue
+			}
 			peerIdInt := int32(peerId)
-			peerAddr := parts[1]
+			peerAddr := fmt.Sprintf("%s:%s", peerHost, parts[1])
 
 			log.Printf("Dialing peer %d at %s", peerId, peerAddr)
 

@@ -69,7 +69,12 @@ func (n *RaftNode) runElectionTimer() {
 		case <-n.heartbeatC:
 			timer.Stop()
 		case <-timer.C:
-			n.StartElection()
+			n.mu.Lock()
+			isLeader := n.state == Leader
+			n.mu.Unlock()
+			if !isLeader {
+				n.StartElection()
+			}
 		}
 	}
 }
@@ -77,8 +82,6 @@ func (n *RaftNode) runElectionTimer() {
 // StartElection transitions to candidate and increments the local term.
 func (n *RaftNode) StartElection() {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
 	n.state = Candidate
 	n.currTerm++
 	n.votedFor = int32(n.id)
@@ -101,11 +104,16 @@ func (n *RaftNode) StartElection() {
 
 	votesReceived := 1
 	quorum := (len(n.peers)+1)/2 + 1
+	peersSnapshot := make(map[int32]pb.RaftServiceClient, len(n.peers))
+	for peerID, peerClient := range n.peers {
+		peersSnapshot[peerID] = peerClient
+	}
+	n.mu.Unlock()
 
 	var wg sync.WaitGroup // waits for a collection of goroutines to finish. integer counter.
 	var voteMu sync.Mutex
 
-	for peerId, peerClient := range n.peers {
+	for peerId, peerClient := range peersSnapshot {
 		wg.Add(1)
 
 		//new go routine for requesting vote from each peer.
@@ -139,11 +147,13 @@ func (n *RaftNode) StartElection() {
 			if res.VoteGranted {
 				voteMu.Lock()
 				votesReceived++
+				reachedQuorum := votesReceived >= quorum
 				voteMu.Unlock()
 
-				if votesReceived >= quorum && n.state == Candidate {
+				if reachedQuorum && n.state == Candidate {
 					log.Printf("Node %d has received quorum of votes in term %d and is now the leader", n.id, currentTerm)
 					n.state = Leader
+					go n.broadcastHeartbeat()
 				}
 			}
 		}(peerId, peerClient)
