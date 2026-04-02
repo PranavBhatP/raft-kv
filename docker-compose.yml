@@ -1,0 +1,51 @@
+version: "3.9"
+
+services:
+  peer1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: raft-peer1
+    hostname: peer1
+    environment:
+      NODE_ID: "1"
+      NODE_PORT: "50051"
+      PEERS: "peer2:50051,peer3:50051"
+    ports:
+      - "5001:50051"
+    networks:
+      - raft-net
+
+  peer2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: raft-peer2
+    hostname: peer2
+    environment:
+      NODE_ID: "2"
+      NODE_PORT: "50051"
+      PEERS: "peer1:50051,peer3:50051"
+    ports:
+      - "5002:50051"
+    networks:
+      - raft-net
+
+  peer3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: raft-peer3
+    hostname: peer3
+    environment:
+      NODE_ID: "3"
+      NODE_PORT: "50051"
+      PEERS: "peer1:50051,peer2:50051"
+    ports:
+      - "5003:50051"
+    networks:
+      - raft-net
+
+networks:
+  raft-net:
+    driver: bridge
