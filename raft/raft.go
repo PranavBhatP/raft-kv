@@ -11,7 +11,7 @@ import (
 
 type NodeState int
 
-//enum for the node states.
+// enum for the node states.
 const (
 	Follower NodeState = iota
 	Candidate
@@ -22,7 +22,7 @@ type RaftNode struct {
 	pb.UnimplementedRaftServiceServer
 
 	mu sync.Mutex // mutex lock for the node's state, ensures atomic access to shared variables
-	id int64
+	id int32
 
 	state NodeState
 
@@ -37,15 +37,15 @@ type RaftNode struct {
 
 	heartbeatC chan struct{}
 }
- 
-func NewRaftNode(id int64) *RaftNode {
+
+func NewRaftNode(id int32) *RaftNode {
 	return &RaftNode{
 		id:         id,
 		state:      Follower,
 		currTerm:   0,
 		votedFor:   -1,
 		peers:      make(map[int32]pb.RaftServiceClient), // empty map.
-		heartbeatC: make(chan struct{}, 1), // event channel for heartbeat messages from leader.
+		heartbeatC: make(chan struct{}, 1),               // event channel for heartbeat messages from leader.
 	}
 
 }
@@ -93,8 +93,8 @@ func (n *RaftNode) StartElection() {
 	}
 
 	req := &pb.VoteRequest{
-		Term:        currentTerm,
-		CandidateId: int32(n.id),
+		Term:         currentTerm,
+		CandidateId:  n.id,
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
 	}
@@ -141,15 +141,70 @@ func (n *RaftNode) StartElection() {
 				votesReceived++
 				voteMu.Unlock()
 
-				if votesReceived >= quorum && n.state==Candidate {
+				if votesReceived >= quorum && n.state == Candidate {
 					log.Printf("Node %d has received quorum of votes in term %d and is now the leader", n.id, currentTerm)
-					n.state=Leader
-				}	
+					n.state = Leader
+				}
 			}
 		}(peerId, peerClient)
 	}
 
 	wg.Wait()
+}
+
+func (n *RaftNode) broadcastHeartbeat() {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		n.sendHeartbeat()
+		<-ticker.C
+
+		n.mu.Lock()
+		if n.state != Leader {
+			n.mu.Unlock()
+			return
+		}
+		n.mu.Unlock()
+	}
+}
+
+func (n *RaftNode) sendHeartbeat() {
+	n.mu.Lock()
+	//defer n.mu.Unlock()
+
+	currentTerm := n.currTerm
+	leaderId := n.id
+
+	req := &pb.AppendRequest{
+		Term:     currentTerm,
+		LeaderId: leaderId,
+	}
+	n.mu.Unlock()
+
+	for peerId, peerClient := range n.peers {
+		go func(pId int32, c pb.RaftServiceClient) {
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+
+			res, err := c.AppendEntries(ctx, req)
+			if err != nil {
+				log.Printf("Node %d failed to send heartbeat to peer %d: %v", n.id, pId, err)
+				return
+			}
+
+			n.mu.Lock()
+			defer n.mu.Unlock()
+
+			if res.Term > n.currTerm {
+				log.Printf("Node %d is stepping down from leader to follower due to obsolete term %d", n.id, n.currTerm)
+				//reset the state and term.
+				n.currTerm = res.Term
+				n.state = Follower
+				n.votedFor = -1
+				return
+			}
+		}(peerId, peerClient)
+	}
 }
 
 func (n *RaftNode) RequestVote(ctx context.Context, req *pb.VoteRequest) (*pb.VoteResponse, error) {
@@ -158,6 +213,13 @@ func (n *RaftNode) RequestVote(ctx context.Context, req *pb.VoteRequest) (*pb.Vo
 
 	if req.Term < n.currTerm {
 		//reject the request forr the vote since it is from and outdated candidate.
+		n.state = Follower
+		n.votedFor = -1
+
+		if req.CandidateId != n.id {
+			return &pb.VoteResponse{Term: n.currTerm, VoteGranted: false}, nil
+		}
+
 		log.Printf("Node %d rejected vote request from candidate %d in outdated term %d", n.id, req.CandidateId, req.Term)
 		return &pb.VoteResponse{Term: n.currTerm, VoteGranted: false}, nil
 	}

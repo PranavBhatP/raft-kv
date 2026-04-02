@@ -38,7 +38,7 @@ func main() {
 
 	log.Printf("starting raft node %d on port %s", nodeId, port)
 
-	node := raft.NewRaftNode(int64(nodeIdInt))
+	node := raft.NewRaftNode(nodeIdInt)
 	go node.Run()
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
