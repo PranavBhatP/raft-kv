@@ -403,8 +403,10 @@ func (n *RaftNode) AppendEntries(ctx context.Context, req *pb.AppendRequest) (*p
 
 func (n *RaftNode) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-
+	if n.state != Leader {
+		n.mu.Unlock()
+		return &pb.PutResponse{Success: false, LeaderId: -1}, nil
+	}
 	command := "PUT " + req.Key + " " + req.Value
 	entry := &pb.LogEntry{
 		Term:    n.currTerm,
@@ -414,7 +416,7 @@ func (n *RaftNode) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse
 	entryIndex := int64(len(n.log) - 1)
 	n.mu.Unlock()
 
-	go n.sendHeartbeat() //hearbeat to request followers to append the entry to their logs.
+	go n.sendHeartbeat()
 
 	for {
 		n.mu.Lock()
