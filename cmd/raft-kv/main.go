@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math/rand"
@@ -15,8 +16,29 @@ import (
 	pb "github.com/PranavBhatP/raft-kv/proto"
 	"github.com/PranavBhatP/raft-kv/raft"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+// waitUntilConnReady blocks until c reaches READY or ctx is done. New gRPC
+// connections start idle; the first RPC would race election RPCs against
+// TCP handshakes, which often exceeds a short deadline under docker-compose.
+func waitUntilConnReady(ctx context.Context, c *grpc.ClientConn) error {
+	for {
+		state := c.GetState()
+		switch state {
+		case connectivity.Ready:
+			return nil
+		case connectivity.Shutdown:
+			return fmt.Errorf("connection closed before ready")
+		case connectivity.Idle:
+			c.Connect()
+		}
+		if !c.WaitForStateChange(ctx, state) {
+			return ctx.Err()
+		}
+	}
+}
 
 func main() {
 
@@ -39,7 +61,6 @@ func main() {
 	log.Printf("starting raft node %d on port %s", nodeId, port)
 
 	node := raft.NewRaftNode(nodeIdInt)
-	go node.Run()
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
@@ -80,10 +101,18 @@ func main() {
 				log.Fatalf("failed to dial peer %d at %s: %v", peerId, peerAddr, err)
 				continue
 			}
+			readyCtx, readyCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err = waitUntilConnReady(readyCtx, conn)
+			readyCancel()
+			if err != nil {
+				log.Fatalf("peer %d at %s did not become ready: %v", peerId, peerAddr, err)
+			}
 			peerClient := pb.NewRaftServiceClient(conn) //client stub for the peer.
 			node.AddPeer(peerIdInt, peerClient)
 		}
 	}
+
+	go node.Run()
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig

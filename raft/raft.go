@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,17 +36,25 @@ type RaftNode struct {
 	commitIndex int64
 	lastApplied int64
 
+	nextIndex  map[int32]int64 //idx of the next log entry to send to a peer.
+	matchIndex map[int32]int64 //idx of the highest log entry known to be replicated on a peer.
+
+	kvStore map[string]string
+
 	heartbeatC chan struct{}
 }
 
 func NewRaftNode(id int32) *RaftNode {
 	return &RaftNode{
-		id:         id,
-		state:      Follower,
-		currTerm:   0,
-		votedFor:   -1,
-		peers:      make(map[int32]pb.RaftServiceClient), // empty map.
-		heartbeatC: make(chan struct{}, 1),               // event channel for heartbeat messages from leader.
+		id:          id,
+		state:       Follower,
+		currTerm:    0,
+		votedFor:    -1,
+		peers:       make(map[int32]pb.RaftServiceClient), // empty map.
+		kvStore:     make(map[string]string),
+		heartbeatC:  make(chan struct{}, 1), // event channel for heartbeat messages from leader.
+		commitIndex: -1,
+		lastApplied: -1,
 	}
 
 }
@@ -120,7 +129,7 @@ func (n *RaftNode) StartElection() {
 		go func(pId int32, c pb.RaftServiceClient) {
 			defer wg.Done()
 			//timeout for rpc request to peers.
-			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 
 			res, err := c.RequestVote(ctx, req)
@@ -153,6 +162,13 @@ func (n *RaftNode) StartElection() {
 				if reachedQuorum && n.state == Candidate {
 					log.Printf("Node %d has received quorum of votes in term %d and is now the leader", n.id, currentTerm)
 					n.state = Leader
+					next := int64(len(n.log))
+					n.nextIndex = make(map[int32]int64, len(n.peers))
+					n.matchIndex = make(map[int32]int64, len(n.peers))
+					for pid := range n.peers {
+						n.nextIndex[pid] = next
+						n.matchIndex[pid] = -1
+					}
 					go n.broadcastHeartbeat()
 				}
 			}
@@ -162,6 +178,20 @@ func (n *RaftNode) StartElection() {
 	wg.Wait()
 }
 
+func (n *RaftNode) applyLogs() {
+	//as long as a log is unapplied we run the apply logs.
+	for n.lastApplied < n.commitIndex {
+		n.lastApplied++
+		entry := n.log[n.lastApplied]
+		parts := strings.SplitN(entry.Command, " ", 3)
+		if len(parts) == 3 && parts[0] == "PUT" {
+			n.kvStore[parts[1]] = parts[2]
+			log.Printf("Node %d applied PUT command: %s = %s", n.id, parts[1], parts[2])
+		}
+	}
+}
+
+// sends heartbeat to all followers at regular intervals.
 func (n *RaftNode) broadcastHeartbeat() {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
@@ -182,17 +212,41 @@ func (n *RaftNode) sendHeartbeat() {
 	n.mu.Lock()
 	//defer n.mu.Unlock()
 
+	if n.state != Leader {
+		n.mu.Unlock()
+		return
+	}
+
 	currentTerm := n.currTerm
 	leaderId := n.id
-
-	req := &pb.AppendRequest{
-		Term:     currentTerm,
-		LeaderId: leaderId,
-	}
 	n.mu.Unlock()
 
 	for peerId, peerClient := range n.peers {
 		go func(pId int32, c pb.RaftServiceClient) {
+			n.mu.Lock()
+			nextIdx := n.nextIndex[pId]
+			prevLogIndex := nextIdx - 1
+			prevLogTerm := int64(-1)
+
+			if prevLogIndex >= 0 && prevLogIndex < int64(len(n.log)) {
+				prevLogTerm = n.log[prevLogIndex].Term
+			}
+			//copy of the updated log only for the required indices (nextIdx onwards)
+			var entries []*pb.LogEntry
+			if nextIdx < int64(len(n.log)) {
+				entries = n.log[nextIdx:]
+			}
+
+			req := &pb.AppendRequest{
+				Term:         currentTerm,
+				LeaderId:     leaderId,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      entries,
+				LeaderCommit: n.commitIndex,
+			}
+			n.mu.Unlock()
+
 			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 			defer cancel()
 
@@ -212,6 +266,37 @@ func (n *RaftNode) sendHeartbeat() {
 				n.state = Follower
 				n.votedFor = -1
 				return
+			}
+
+			if n.state == Leader && res.Term == n.currTerm {
+				if res.Success {
+					//follower accepted the log, update our trackers.
+					n.matchIndex[pId] = prevLogIndex + int64(len(entries))
+					n.nextIndex[pId] = n.matchIndex[pId] + 1
+					quorum := (len(n.peers)+1)/2 + 1
+					for i := int64(len(n.log) - 1); i > n.commitIndex; i-- {
+						// Raft Rule: Only commit entries from our current term
+						if n.log[i].Term == n.currTerm {
+							matchCount := 1
+							for _, matchIdx := range n.matchIndex {
+								if matchIdx >= i {
+									matchCount++
+								}
+							}
+							if matchCount >= quorum {
+								n.commitIndex = i
+								n.applyLogs()
+								break
+							}
+						}
+					}
+				} else {
+					// Follower rejected due to log inconsistency. Backtrack and try again.
+					n.nextIndex[pId]--
+					if n.nextIndex[pId] < 0 {
+						n.nextIndex[pId] = 0
+					}
+				}
 			}
 		}(peerId, peerClient)
 	}
@@ -280,17 +365,79 @@ func (n *RaftNode) AppendEntries(ctx context.Context, req *pb.AppendRequest) (*p
 		return &pb.AppendResponse{Term: n.currTerm, Success: false}, nil
 	}
 
-	if req.Term > n.currTerm {
+	if req.Term > n.currTerm || n.state != Follower {
 		n.currTerm = req.Term
+		n.state = Follower
+		n.votedFor = -1
 	}
-	n.state = Follower
-	n.votedFor = -1
 
-	// Heartbeat/append received from a valid leader; reset election timer.
 	select {
 	case n.heartbeatC <- struct{}{}:
 	default:
 	}
 
+	if req.PrevLogIndex >= 0 {
+		if req.PrevLogIndex >= int64(len(n.log)) {
+			return &pb.AppendResponse{Term: n.currTerm, Success: false}, nil
+		}
+
+		if n.log[req.PrevLogIndex].Term != req.PrevLogTerm {
+			return &pb.AppendResponse{Term: n.currTerm, Success: false}, nil
+		}
+	}
+
+	n.log = append(n.log[:req.PrevLogIndex+1], req.Entries...)
+
+	if req.LeaderCommit > n.commitIndex {
+		lastNewEntry := int64(len(n.log) - 1)
+		if req.LeaderCommit > lastNewEntry {
+			n.commitIndex = req.LeaderCommit
+		} else {
+			n.commitIndex = lastNewEntry
+		}
+		n.applyLogs()
+	}
+
 	return &pb.AppendResponse{Term: n.currTerm, Success: true}, nil
+}
+
+func (n *RaftNode) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	command := "PUT " + req.Key + " " + req.Value
+	entry := &pb.LogEntry{
+		Term:    n.currTerm,
+		Command: command,
+	}
+	n.log = append(n.log, entry)
+	entryIndex := int64(len(n.log) - 1)
+	n.mu.Unlock()
+
+	go n.sendHeartbeat() //hearbeat to request followers to append the entry to their logs.
+
+	for {
+		n.mu.Lock()
+		if n.commitIndex >= entryIndex {
+			n.mu.Unlock()
+			return &pb.PutResponse{Success: true, LeaderId: n.id}, nil
+		}
+		if n.state != Leader {
+			n.mu.Unlock()
+			return &pb.PutResponse{Success: false, LeaderId: -1}, nil
+		}
+		n.mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+func (n *RaftNode) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	value, exists := n.kvStore[req.Key]
+	if !exists {
+		log.Printf("Leader %d did not find the key %s in the KV store", n.id, req.Key)
+		return &pb.GetResponse{Success: false, Value: ""}, nil
+	}
+	return &pb.GetResponse{Success: true, Value: value}, nil
 }
